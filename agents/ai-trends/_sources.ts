@@ -1,4 +1,3 @@
-import { evaluateItemsWithJev } from './_jev.js';
 import { collectTikhub } from './_tikhub.js';
 import type { TrendSourceItem } from './_types.js';
 
@@ -268,10 +267,10 @@ export async function collectFromWeb(
 }
 
 /**
- * Unified collection. When `env` carries a model gateway key, candidates are
- * filtered & categorized by the @makers/jev decision model in one batch; on
- * any jev failure we degrade to the keyword filter below. TikHub sources
- * (X/Reddit/Weibo/YouTube) are enabled via TIKHUB_TOKEN + TIKHUB_SOURCES.
+ * Unified collection. Keyword filter is the coarse pre-gate (fast, free);
+ * the semantic gate runs later in the pipeline via the jev decision model
+ * (see curateWithJev in _model.ts). TikHub sources (X/Reddit/Weibo/YouTube)
+ * are enabled via TIKHUB_TOKEN + TIKHUB_SOURCES.
  */
 export async function collectSources(
   sources: string[] = ['hackernews', 'devto'],
@@ -290,7 +289,7 @@ export async function collectSources(
   const [hnItems, devtoItems, webItems, tikhubItems] = batches;
   const raw = [...hnItems, ...devtoItems, ...webItems, ...tikhubItems];
 
-  // Dedup raw candidates before evaluation (same URL/title may appear in multiple sources)
+  // Dedup raw candidates (same URL/title may appear in multiple sources)
   const seenKeys = new Set<string>();
   const deduped = raw.filter(item => {
     const key = String(item.url || item.title || item.id).toLowerCase();
@@ -299,38 +298,10 @@ export async function collectSources(
     return true;
   });
 
-  // ── Primary path: jev decision model (relevance + quality + category) ──
-  if (env) {
-    try {
-      const decisions = await evaluateItemsWithJev(env, deduped, signal);
-      if (decisions) {
-        const kept = deduped
-          .filter(item => {
-            const d = decisions.get(item.id);
-            return d?.relevant && d?.keep;
-          })
-          .map(item => {
-            const d = decisions.get(item.id)!;
-            return { ...item, category: d.category };
-          });
-        console.log(`[sources] jev filter kept ${kept.length}/${deduped.length}`);
-        if (kept.length) return balanceAcrossSources(kept, limit);
-        console.log('[sources] jev kept 0 items — falling back to keyword filter');
-      }
-    } catch (error: any) {
-      if (signal?.aborted || error?.name === 'AbortError') throw error;
-      console.warn(`[sources] jev evaluation failed, falling back to keywords: ${error?.message}`);
-    }
-  }
-
-  // ── Fallback: keyword filter per source ──
-  const filteredHn = filterAiItems(hnItems);
-  const filteredDevto = filterAiItems(devtoItems);
-  const filteredWeb = filterAiItems(webItems);
-  // TikHub items go through the keyword filter too in fallback mode
-  const filteredTikhub = filterAiItems(tikhubItems);
-  console.log(`[sources] keyword filter — HN: ${filteredHn.length}, DevTo: ${filteredDevto.length}, Web: ${filteredWeb.length}, TikHub: ${filteredTikhub.length}`);
-  return balanceAcrossSources([...filteredHn, ...filteredDevto, ...filteredWeb, ...filteredTikhub], limit);
+  // ── Coarse gate: keyword filter ──
+  const filtered = filterAiItems(deduped);
+  console.log(`[sources] keyword filter kept ${filtered.length}/${deduped.length}`);
+  return balanceAcrossSources(filtered, limit);
 }
 
 /**

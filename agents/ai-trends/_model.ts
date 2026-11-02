@@ -59,12 +59,18 @@ function parseJsonFromText<T>(text: string): T | null {
       .replace(/,\s*([}\]])/g, '$1')
       .replace(/,\s*$/g, '');
     try { return JSON.parse(fixed) as T; } catch { /* continue */ }
-    // Try to fix truncated JSON by closing brackets
+    // Try to fix truncated JSON: close an unterminated string first, then
+    // strip a dangling partial "key": fragment, then close open brackets.
     let attempt = fixed;
+    // Count unescaped quotes — odd means we're inside a string literal
+    const unescapedQuotes = (attempt.replace(/\\"/g, '').match(/"/g) || []).length;
+    if (unescapedQuotes % 2 === 1) attempt += '"';
+    // Drop a dangling partial fragment like `,"aiSum` or `"key":"val` cut mid-way
+    attempt = attempt.replace(/,\s*"?[^",:}\]]*"?(?::\s*"?[^",:}\]]*)?$/, '');
+    attempt = attempt.replace(/"\s*$/, '');
     const opens = (attempt.match(/[{[]/g) || []).length;
     const closes = (attempt.match(/[}\]]/g) || []).length;
     for (let i = 0; i < opens - closes; i++) {
-      // Determine which bracket to close
       const lastOpen = Math.max(attempt.lastIndexOf('{'), attempt.lastIndexOf('['));
       attempt += attempt[lastOpen] === '{' ? '}' : ']';
     }
@@ -222,7 +228,9 @@ async function curateWithJev(
         url: item.url,
         source: item.source,
         category: d?.category || item.category || 'AI Hardware Industry',
-        reason: d ? `AI硬件相关度 ${Math.round(d.relevanceP * 100)}%` : '',
+        reason: d
+          ? (d.relevanceP < 0 ? 'jev调用失败，默认保留' : `AI硬件相关度 ${Math.round(d.relevanceP * 100)}%`)
+          : '',
         keep: Boolean(d?.relevant && d?.keep),
       };
     }),
@@ -613,7 +621,18 @@ export async function runAgentPipeline(input: PipelineInput): Promise<{
     // Process Summarizer
     if (summarizerResult.status === 'fulfilled') {
       const raw = String(summarizerResult.value.finalOutput || '');
-      const parsed = parseJsonFromText<SummarizerOutput>(raw);
+      let parsed = parseJsonFromText<SummarizerOutput>(raw);
+      // Truncated outputs: salvage complete {id, aiSummary} pairs via regex
+      if (!parsed?.items?.length) {
+        const salvaged: SummarizerOutput['items'] = [];
+        const pairRe = /"id"\s*:\s*"([^"]+)"\s*,\s*"aiSummary"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+        let m: RegExpExecArray | null;
+        while ((m = pairRe.exec(raw)) !== null) salvaged.push({ id: m[1], aiSummary: m[2] });
+        if (salvaged.length) {
+          parsed = { items: salvaged };
+          console.log(`[pipeline] Summarizer: salvaged ${salvaged.length} summaries from truncated output`);
+        }
+      }
       if (parsed?.items?.length) {
         stages.summarizerOutput = parsed;
         const summaryMap = new Map(

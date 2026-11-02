@@ -5,129 +5,195 @@ import type { TrendSourceItem } from './_types.js';
 // Adds X/Twitter search, Reddit subreddits, Weibo hot search and YouTube
 // search as structured API sources — replacing fragile sandbox browser
 // scraping. Token comes from `context.env.TIKHUB_TOKEN` (Makers red line:
-// never process.env). All endpoints confirmed against TikHub's OpenAPI
-// spec (https://api.tikhub.io/openapi.json, 2026-11):
-//   GET /api/v1/twitter/web/fetch_search_timeline?keyword=&search_type=
-//   GET /api/v1/reddit/app/fetch_subreddit_feed?subreddit_name=&sort=
-//   GET /api/v1/weibo/app/fetch_hot_search?category=realtimehot&page=1&count=
-//   GET /api/v1/youtube/web/search_video?search_query=&order_by=this_month
+// never process.env).
 //
-// Response payloads are wrapped in TikHub's generic ResponseModel and the
-// inner shapes vary per platform/version — extraction is therefore done by
-// a defensive deep-walk (field-candidate matching), never by strict paths.
+// Endpoints confirmed against TikHub's OpenAPI spec
+// (https://api.tikhub.io/openapi.json) and validated against live payloads
+// (2026-11):
+//   GET /api/v1/twitter/web/fetch_search_timeline?keyword=&search_type=
+//     → data.timeline[] with { tweet_id, text, favorites, views, screen_name }
+//   GET /api/v1/reddit/app/fetch_subreddit_feed?subreddit_name=
+//     → GraphQL-style cells: TitleCell / ActionCell siblings joined by a
+//       base64 id that decodes to "TitleCell-t3_<post_id>"
+//   GET /api/v1/weibo/web_v2/fetch_hot_search
+//     → data.realtime[] with { word, note, num, realpos }
+//   GET /api/v1/youtube/web/search_video?search_query=&order_by=this_month
+//     → data.videos[] with { video_id, title, number_of_views }
+//
+// Each platform gets a dedicated mapper (validated against real payloads);
+// a generic deep-walk extractor stays as fallback for unknown shapes.
 
 const TIKHUB_BASE = 'https://api.tikhub.io';
-
-// Field candidates for the generic extractor
-const TITLE_KEYS = ['title', 'note', 'word', 'text', 'full_text', 'headline', 'name', 'subject', 'description'];
-const TEXT_KEYS = ['text', 'full_text', 'summary', 'description', 'excerpt', 'content', 'note', 'reason'];
-const URL_KEYS = ['url', 'permalink', 'short_url', 'web_url', 'link', 'share_url', 'target_url'];
-const ID_KEYS = ['id_str', 'rest_id', 'videoId', 'video_id', 'id', 'bid', 'mid', 'item_id'];
-const SCORE_KEYS = [
-  'favorite_count', 'like_count', 'likes', 'digg_count', 'ups', 'upvotes',
-  'score', 'raw_hot', 'hot_value', 'num', 'view_count', 'views',
-  'reposts_count', 'read_count', 'play_count', 'comment_count',
-];
-
-interface ExtractedRaw {
-  id: string;
-  title: string;
-  text: string;
-  url: string;
-  score: number;
-}
-
-function firstString(obj: Record<string, unknown>, keys: string[], exclude?: string): string {
-  for (const key of keys) {
-    const value = obj[key];
-    if (typeof value === 'string' && value.trim() && value !== exclude) return value.trim();
-  }
-  return '';
-}
-
-function firstNumber(obj: Record<string, unknown>, keys: string[]): number {
-  let best = 0;
-  for (const key of keys) {
-    const value = obj[key];
-    if (typeof value === 'number' && Number.isFinite(value) && value > best) best = value;
-    if (typeof value === 'string' && /^[\d.]+$/.test(value) && parseFloat(value) > best) best = parseFloat(value);
-  }
-  return best;
-}
 
 function hashKey(input: string): string {
   return Buffer.from(input).toString('base64url').slice(0, 24);
 }
 
-/**
- * Deep-walk any JSON payload and pull out item-like objects (have a title
- * and an id/url). Platform-agnostic — tolerates TikHub wrapper versions.
- */
-function extractRawNodes(node: unknown, out: ExtractedRaw[], depth = 0): void {
-  if (!node || depth > 12 || out.length > 200) return;
+/** Collect every object node in a JSON payload (bounded). */
+function findDicts(node: unknown, out: Array<Record<string, unknown>>, depth = 0): void {
+  if (out.length > 800 || depth > 14 || !node || typeof node !== 'object') return;
   if (Array.isArray(node)) {
-    for (const child of node) extractRawNodes(child, out, depth + 1);
+    for (const child of node) findDicts(child, out, depth + 1);
     return;
   }
-  if (typeof node !== 'object') return;
-  const obj = node as Record<string, unknown>;
-
-  const title = firstString(obj, TITLE_KEYS);
-  const id = firstString(obj, ID_KEYS);
-  const hasIdOrUrl = id || firstString(obj, URL_KEYS);
-  if (title.length >= 4 && title.length <= 300 && hasIdOrUrl) {
-    out.push({
-      id,
-      title,
-      text: firstString(obj, TEXT_KEYS, title).slice(0, 400),
-      url: firstString(obj, URL_KEYS),
-      score: firstNumber(obj, SCORE_KEYS),
-    });
-  }
-  for (const value of Object.values(obj)) {
-    if (value && typeof value === 'object') extractRawNodes(value, out, depth + 1);
+  out.push(node as Record<string, unknown>);
+  for (const value of Object.values(node)) {
+    if (value && typeof value === 'object') findDicts(value, out, depth + 1);
   }
 }
 
-function absolutize(url: string, base: string): string {
-  if (!url) return base;
-  if (url.startsWith('http://') || url.startsWith('https://')) return url;
-  return url.startsWith('/') ? `https://${base}${url}` : base;
+function asNumber(value: unknown): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && /^[\d,]+$/.test(value.replace(/\s/g, ''))) {
+    return parseFloat(value.replace(/,/g, ''));
+  }
+  return 0;
 }
 
-interface TikhubSourceDef {
-  name: string;
-  prefix: string;
-  buildUrl(item: ExtractedRaw): string;
-  /** Post-filter: skip noise (e.g. Weibo entertainment hot entries) */
-  accept?(item: ExtractedRaw): boolean;
+function pushItem(
+  items: TrendSourceItem[],
+  seen: Set<string>,
+  item: TrendSourceItem,
+  limit: number,
+): void {
+  if (items.length >= limit) return;
+  const key = item.url.toLowerCase();
+  if (seen.has(key)) return;
+  seen.add(key);
+  items.push(item);
 }
 
-const SOURCE_DEFS: Record<string, TikhubSourceDef> = {
-  x: {
-    name: 'X',
-    prefix: 'x',
-    buildUrl: item => item.url || `https://x.com/i/web/status/${item.id}`,
-  },
-  reddit: {
-    name: 'Reddit',
-    prefix: 'reddit',
-    buildUrl: item => absolutize(item.url, 'www.reddit.com'),
-  },
-  weibo: {
-    name: 'Weibo',
-    prefix: 'wb',
-    // Hot-search entries carry the keyword, not a link — build the search URL
-    buildUrl: item => item.url || `https://s.weibo.com/weibo?q=${encodeURIComponent(`#${item.title}#`)}`,
-    // Skip clearly non-tech trending topics; jev does semantic filtering later
-    accept: item => item.title.length >= 4,
-  },
-  youtube: {
-    name: 'YouTube',
-    prefix: 'yt',
-    buildUrl: item => item.url || `https://www.youtube.com/watch?v=${item.id}`,
-  },
-};
+// ── X / Twitter mapper ────────────────────────────────────────────
+
+function mapX(payload: unknown, limit: number): TrendSourceItem[] {
+  const nodes: Array<Record<string, unknown>> = [];
+  findDicts(payload, nodes);
+  const items: TrendSourceItem[] = [];
+  const seen = new Set<string>();
+  for (const node of nodes) {
+    const tweetId = node.tweet_id;
+    const text = typeof node.text === 'string' ? node.text.trim() : '';
+    if (typeof tweetId !== 'string' || !tweetId || text.length < 10) continue;
+    const screenName = typeof node.screen_name === 'string' ? node.screen_name.replace(/^@/, '') : 'i';
+    const favorites = asNumber(node.favorites);
+    const views = asNumber(node.views);
+    pushItem(items, seen, {
+      id: `x_${tweetId}`,
+      source: 'X',
+      title: text.slice(0, 200),
+      url: `https://x.com/${screenName}/status/${tweetId}`,
+      score: favorites || Math.round(views / 100), // views are huge — scale to like-comparable
+      publishedAt: new Date().toISOString(),
+      summary: '',
+    }, limit);
+  }
+  return items;
+}
+
+// ── Reddit mapper (base64-cell merge) ─────────────────────────────
+
+/**
+ * Reddit app API returns GraphQL-style cells where the post title
+ * (TitleCell) and its engagement (ActionCell) are sibling objects. Their
+ * base64 ids decode to "TitleCell-t3_<post_id>" / "ActionCell-t3_<post_id>"
+ * (comment cells carry an extra "-<uuid>" suffix) — join cells on the
+ * decoded post id.
+ */
+function mapReddit(payload: unknown, limit: number): TrendSourceItem[] {
+  const nodes: Array<Record<string, unknown>> = [];
+  findDicts(payload, nodes);
+
+  interface PostSlot { title?: string; score?: number; comments?: number }
+  const posts = new Map<string, PostSlot>();
+  for (const node of nodes) {
+    const rawId = node.id;
+    if (typeof rawId !== 'string' || rawId.length < 8) continue;
+    let decoded: string;
+    try {
+      decoded = Buffer.from(rawId, 'base64').toString('utf-8');
+    } catch {
+      continue;
+    }
+    const match = decoded.match(/-t3_([A-Za-z0-9]+)/);
+    if (!match) continue;
+    const postId = match[1];
+    const slot = posts.get(postId) ?? {};
+    const title = typeof node.title === 'string' ? node.title.trim() : '';
+    if (title && (!slot.title || title.length > slot.title.length)) slot.title = title;
+    const score = asNumber(node.score);
+    if (score > (slot.score ?? 0)) slot.score = score;
+    const comments = asNumber(node.commentCount);
+    if (comments > (slot.comments ?? 0)) slot.comments = comments;
+    posts.set(postId, slot);
+  }
+
+  const items: TrendSourceItem[] = [];
+  const seen = new Set<string>();
+  for (const [postId, slot] of posts) {
+    if (!slot.title) continue;
+    pushItem(items, seen, {
+      id: `reddit_${postId}`,
+      source: 'Reddit',
+      title: slot.title.slice(0, 200),
+      url: `https://www.reddit.com/comments/${postId}`,
+      score: slot.score ?? 0,
+      publishedAt: new Date().toISOString(),
+      summary: slot.comments != null ? `${slot.comments} comments` : '',
+    }, limit);
+  }
+  return items;
+}
+
+// ── Weibo hot search mapper (web_v2) ──────────────────────────────
+
+function mapWeibo(payload: unknown, limit: number): TrendSourceItem[] {
+  const nodes: Array<Record<string, unknown>> = [];
+  findDicts(payload, nodes);
+  const items: TrendSourceItem[] = [];
+  const seen = new Set<string>();
+  for (const node of nodes) {
+    const word = typeof node.word === 'string' ? node.word.trim() : '';
+    if (word.length < 4) continue;
+    const num = asNumber(node.num);
+    pushItem(items, seen, {
+      id: `wb_${hashKey(word)}`,
+      source: 'Weibo',
+      title: word,
+      url: `https://s.weibo.com/weibo?q=${encodeURIComponent(`#${word}#`)}`,
+      score: num,
+      publishedAt: new Date().toISOString(),
+      summary: typeof node.note === 'string' ? node.note : '',
+    }, limit);
+  }
+  return items;
+}
+
+// ── YouTube mapper ────────────────────────────────────────────────
+
+function mapYouTube(payload: unknown, limit: number): TrendSourceItem[] {
+  const nodes: Array<Record<string, unknown>> = [];
+  findDicts(payload, nodes);
+  const items: TrendSourceItem[] = [];
+  const seen = new Set<string>();
+  for (const node of nodes) {
+    const videoId = node.video_id ?? node.videoId;
+    const title = typeof node.title === 'string' ? node.title.trim() : '';
+    if (typeof videoId !== 'string' || !videoId || title.length < 5) continue;
+    const views = asNumber(node.number_of_views ?? node.viewCount);
+    pushItem(items, seen, {
+      id: `yt_${videoId}`,
+      source: 'YouTube',
+      title: title.slice(0, 200),
+      url: `https://www.youtube.com/watch?v=${videoId}`,
+      score: views,
+      publishedAt: new Date().toISOString(),
+      summary: typeof node.description === 'string' ? node.description.slice(0, 200) : '',
+    }, limit);
+  }
+  return items;
+}
+
+// ── API plumbing ──────────────────────────────────────────────────
 
 async function fetchTikhubApi(
   path: string,
@@ -154,7 +220,7 @@ async function fetchTikhubApi(
       return null;
     }
     const data = await res.json().catch(() => null);
-    // TikHub wraps payloads: { code, message, data: ... } or { data: { data: ... } }
+    // TikHub wraps payloads: { code, message, data: ... }
     return (data as { data?: unknown })?.data ?? data;
   } catch (err: any) {
     if (err?.name === 'AbortError' && signal?.aborted) throw err;
@@ -164,36 +230,6 @@ async function fetchTikhubApi(
     clearTimeout(timer);
     signal?.removeEventListener('abort', onExternalAbort);
   }
-}
-
-function collectFromPayload(
-  payload: unknown,
-  def: TikhubSourceDef,
-  limit: number,
-): TrendSourceItem[] {
-  if (!payload) return [];
-  const raw: ExtractedRaw[] = [];
-  extractRawNodes(payload, raw);
-
-  const seen = new Set<string>();
-  const items: TrendSourceItem[] = [];
-  for (const node of raw) {
-    if (items.length >= limit) break;
-    if (def.accept && !def.accept(node)) continue;
-    const dedupeKey = (node.url || node.title).toLowerCase();
-    if (seen.has(dedupeKey)) continue;
-    seen.add(dedupeKey);
-    items.push({
-      id: `${def.prefix}_${node.id || hashKey(dedupeKey)}`,
-      source: def.name,
-      title: node.title,
-      url: def.buildUrl(node),
-      score: node.score,
-      publishedAt: new Date().toISOString(),
-      summary: node.text,
-    });
-  }
-  return items;
 }
 
 export interface CollectTikhubOptions {
@@ -224,48 +260,56 @@ export async function collectTikhub(
     .filter(Boolean);
   const perSourceLimit = opts.perSourceLimit ?? 20;
 
-  const tasks: Array<Promise<TrendSourceItem[]>> = [];
+  const tasks: Array<{ name: string; run: Promise<TrendSourceItem[]> }> = [];
 
   if (enabled.includes('x')) {
     const keyword = opts.xQuery || env.TIKHUB_X_QUERY
       || 'AI hardware OR "humanoid robot" OR "AI chip" OR "AI glasses" OR "smart ring" OR "edge AI"';
-    tasks.push(
-      fetchTikhubApi('/api/v1/twitter/web/fetch_search_timeline', { keyword, search_type: 'Top' }, token, signal)
-        .then(payload => collectFromPayload(payload, SOURCE_DEFS.x, perSourceLimit)),
-    );
+    tasks.push({
+      name: 'X',
+      run: fetchTikhubApi('/api/v1/twitter/web/fetch_search_timeline', { keyword, search_type: 'Top' }, token, signal)
+        .then(payload => mapX(payload, perSourceLimit)),
+    });
   }
   if (enabled.includes('reddit')) {
     const subs = opts.redditSubs
       || (env.TIKHUB_REDDIT_SUBS || 'robotics,MachineLearning,LocalLLaMA,hardware').split(',').map(s => s.trim()).filter(Boolean);
     for (const sub of subs.slice(0, 3)) {
-      tasks.push(
-        fetchTikhubApi('/api/v1/reddit/app/fetch_subreddit_feed', { subreddit_name: sub }, token, signal)
-          .then(payload => collectFromPayload(payload, SOURCE_DEFS.reddit, Math.ceil(perSourceLimit / 2))),
-      );
+      tasks.push({
+        name: `Reddit(${sub})`,
+        run: fetchTikhubApi('/api/v1/reddit/app/fetch_subreddit_feed', { subreddit_name: sub }, token, signal)
+          .then(payload => mapReddit(payload, Math.ceil(perSourceLimit / 2))),
+      });
     }
   }
   if (enabled.includes('weibo')) {
     const count = opts.weiboCount ?? 20;
-    tasks.push(
-      fetchTikhubApi('/api/v1/weibo/app/fetch_hot_search', { category: 'realtimehot', page: 1, count }, token, signal)
-        .then(payload => collectFromPayload(payload, SOURCE_DEFS.weibo, perSourceLimit)),
-    );
+    tasks.push({
+      name: 'Weibo',
+      run: fetchTikhubApi('/api/v1/weibo/web_v2/fetch_hot_search', {}, token, signal)
+        .then(payload => mapWeibo(payload, perSourceLimit)),
+    });
   }
   if (enabled.includes('youtube')) {
     const query = opts.youtubeQuery || env.TIKHUB_YOUTUBE_QUERY || 'AI hardware robot';
-    tasks.push(
-      fetchTikhubApi('/api/v1/youtube/web/search_video', { search_query: query, order_by: 'this_month' }, token, signal)
-        .then(payload => collectFromPayload(payload, SOURCE_DEFS.youtube, perSourceLimit)),
-    );
+    tasks.push({
+      name: 'YouTube',
+      run: fetchTikhubApi('/api/v1/youtube/web/search_video', { search_query: query, order_by: 'this_month' }, token, signal)
+        .then(payload => mapYouTube(payload, perSourceLimit)),
+    });
   }
 
-  const batches = await Promise.allSettled(tasks);
+  const results = await Promise.allSettled(tasks.map(t => t.run));
   const all: TrendSourceItem[] = [];
-  for (const batch of batches) {
-    if (batch.status === 'fulfilled') all.push(...batch.value);
-    else console.warn(`[tikhub] batch failed:`, batch.reason);
-  }
-  const names = all.reduce((acc, i) => { acc[i.source || '?'] = (acc[i.source || '?'] || 0) + 1; return acc; }, {} as Record<string, number>);
-  console.log(`[tikhub] collected:`, JSON.stringify(names), `(${all.length} total)`);
+  results.forEach((result, index) => {
+    const name = tasks[index].name;
+    if (result.status === 'fulfilled') {
+      console.log(`[tikhub] ${name}: ${result.value.length} items`);
+      all.push(...result.value);
+    } else {
+      console.warn(`[tikhub] ${name} failed:`, result.reason);
+    }
+  });
+  console.log(`[tikhub] collected ${all.length} items total`);
   return all;
 }
