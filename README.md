@@ -88,6 +88,8 @@ cp .env.example .env   # 填入环境变量（见下表）
 edgeone makers dev     # 启动本地开发服务
 ```
 
+> 小贴士：已登录 edgeone CLI 的话，首次运行 `edgeone makers dev` 会**自动把控制台的 AI 网关 Key 写进 .env**，你只需要手动补一行 `TIKHUB_TOKEN`（如果要用付费源）。
+
 打开 `http://localhost:8088` 点击「手动生成」即可看到效果。
 
 ## 部署到 EdgeOne Makers
@@ -128,14 +130,14 @@ edgeone makers dev     # 启动本地开发服务
 │   ├── _model.ts              # Summarizer / Analyst / Writer 三个大模型 Agent
 │   ├── _jev.ts                # @makers/jev 决策模型客户端（筛选+打分）
 │   ├── _tikhub.ts             # TikHub 数据源采集（X/Reddit/微博/YouTube）
-│   ├── _sources.ts            # 免费数据源采集 + jev 过滤入口
+│   ├── _sources.ts            # 免费数据源采集 + 关键词粗筛
 │   ├── _items.ts              # 条目库：指纹、去重、跨天合并
 │   ├── _memory.ts / _storage.ts  # 持久化（平台 store / 文件兜底）
-│   └── _report.ts             # 兜底报告生成
+│   ├── _report.ts             # 兜底报告生成
+│   └── tests/                 # 流水线单元测试（npm test）
 ├── cloud-functions/ai-trends/ # 数据查询接口（latest/history/detail/delete/health）
 ├── src/                       # 前端（React + Vite，中英双语）
-├── edgeone.json               # Agent 运行时 + 定时任务配置
-└── tests/                     # 流水线单元测试（npm test）
+└── edgeone.json               # Agent 运行时 + 定时任务配置
 ```
 
 ## 常见问题
@@ -145,6 +147,9 @@ edgeone makers dev     # 启动本地开发服务
 
 **Q：某次运行失败了怎么办？**
 流水线每一环都有兜底：jev 挂了退回关键词过滤，大模型挂了用代码拼报告，报告头部会标注降级原因。
+
+**Q：日志里出现 402 Insufficient remaining quota 怎么办？**
+内置模型的免费额度用完了（或触发限频）。去 Makers 控制台 → Models → 用量 看剩余额度：等额度重置，或在控制台绑定自己的模型 Key（BYOK，任何 OpenAI 兼容服务商都行）。此时流水线不会中断——jev 筛选自动降级为保守保留，报告照常生成，只是内容可能混入少量不相关条目。
 
 **Q：怎么调整每天几点运行？**
 改 `edgeone.json` 里 `schedules[0].cron`（标准 5 段 cron，服务器本地时区）。
@@ -160,3 +165,6 @@ edgeone makers dev     # 启动本地开发服务
 ## License
 
 MIT
+
+
+致谢： https://linux.do 佬友支持
