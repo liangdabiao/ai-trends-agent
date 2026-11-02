@@ -753,7 +753,7 @@ export default function App() {
           <p className={styles.scheduleHint}><IconClock size={12} /> {t('scheduleHint')}</p>
         </div>
         <div className={styles.topActions}>
-          <button className={styles.primaryButton} onClick={run} disabled={loading}>
+          <button className={styles.primaryButton} onClick={run} disabled={loading} style={{ display: 'none' }}>
             {loading ? (
               <><span className={styles.btnSpinner} /> {t('generating')}</>
             ) : (

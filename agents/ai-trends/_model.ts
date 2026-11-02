@@ -693,25 +693,29 @@ export async function runAgentPipeline(input: PipelineInput): Promise<{
     const raw = analystResult.status === 'fulfilled' ? String(analystResult.value.finalOutput || '') : '';
     const parsed = analystResult.status === 'fulfilled' ? parseJsonFromText<TrendAnalysis>(raw) : null;
     const d1 = +(((Date.now() - t1) / 1000).toFixed(1));
+
+    // Score write-back happens regardless of the Analyst LLM outcome — when
+    // the model call fails (e.g. gateway 402), jev scores still land on the
+    // items so the report keeps sort/display quality.
+    let scoreSource = 'none';
+    let scoreMap = new Map<string, number>();
+    if (jevScoresResult.status === 'fulfilled' && jevScoresResult.value) {
+      scoreMap = jevScoresResult.value;
+      scoreSource = 'jev';
+    } else if (parsed?.scores?.length) {
+      scoreMap = new Map(parsed.scores.map(s => [s.id, s.score]));
+      scoreSource = 'analyst-fallback';
+    }
+    if (scoreMap.size) {
+      enrichedItems = enrichedItems.map(item => {
+        const aiScore = scoreMap.get(item.id);
+        return aiScore != null ? { ...item, score: aiScore } : item;
+      });
+    }
+
     if (parsed?.keyInsight || parsed?.categories?.length) {
       analysis = parsed;
       stages.analystOutput = analysis;
-      // Score write-back: jev results take precedence over any analyst scores.
-      let scoreSource = 'none';
-      let scoreMap = new Map<string, number>();
-      if (jevScoresResult.status === 'fulfilled' && jevScoresResult.value) {
-        scoreMap = jevScoresResult.value;
-        scoreSource = 'jev';
-      } else if (analysis.scores?.length) {
-        scoreMap = new Map(analysis.scores.map(s => [s.id, s.score]));
-        scoreSource = 'analyst-fallback';
-      }
-      if (scoreMap.size) {
-        enrichedItems = enrichedItems.map(item => {
-          const aiScore = scoreMap.get(item.id);
-          return aiScore != null ? { ...item, score: aiScore } : item;
-        });
-      }
       const categoryCount = analysis.categories?.length || 0;
       const deepDiveCount = analysis.deepDives?.length || 0;
       const detail = `${categoryCount} categories, ${deepDiveCount} deep dives, scores: ${scoreSource} (${scoreMap.size})`;
@@ -728,10 +732,19 @@ export async function runAgentPipeline(input: PipelineInput): Promise<{
       // Re-emit items with Analyst scores so frontend LiveFeed picks up 0-100 scores.
       emit({ type: 'items', phase: 'summarized', items: enrichedItems });
     } else {
-      const why = analystResult.status === 'rejected' ? `agent error: ${analystResult.reason}` : 'output parse failed';
+      const why = analystResult.status === 'rejected'
+        ? `agent error: ${analystResult.reason instanceof Error ? analystResult.reason.message : analystResult.reason}`
+        : 'output parse failed';
       console.log(`[pipeline] Analyst done (${d1}s): ${why}`);
       if (analystResult.status === 'fulfilled') {
         console.log(`[pipeline] Analyst raw output (first 500 chars):`, raw.slice(0, 500));
+      }
+      stages.failedStage = stages.failedStage || 'analyst';
+      stages.error = stages.error || why;
+      // Still push scored items downstream so Writer/frontend keep the jev scores.
+      if (scoreMap.size) {
+        console.log(`[pipeline] Analyst failed — keeping ${scoreMap.size} jev scores on items`);
+        emit({ type: 'items', phase: 'summarized', items: enrichedItems });
       }
       emit({ stage: 'analyst', status: 'failed', duration: d1, detail: why });
     }
@@ -836,7 +849,13 @@ export async function runAgentPipeline(input: PipelineInput): Promise<{
       const detail = `${markdown.length} chars`;
       console.log(`[pipeline] Writer done (${d2}s): ${detail}`);
       emit({ stage: 'writer', status: 'done', duration: d2, detail });
-      return { report: assembleReportFromWriter(enrichedItems, markdown, runId, trigger), stages };
+      const report = assembleReportFromWriter(enrichedItems, markdown, runId, trigger);
+      // Surface upstream degradation on the report — Writer succeeding does
+      // not mean every stage did (e.g. Analyst 402 → report from raw items).
+      if (stages.failedStage && !report.agentWarning) {
+        report.agentWarning = `阶段 [${stages.failedStage}] 失败（${stages.error || '未知原因'}），报告基于可用数据生成`;
+      }
+      return { report, stages };
     }
     console.log(`[pipeline] Writer done (${d2}s): output too short`);
     emit({ stage: 'writer', status: 'failed', duration: d2, detail: 'output too short' });
