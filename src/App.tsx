@@ -40,7 +40,7 @@ function formatItemTime(value?: string, fallbackLabel = 'Unknown'): string {
 }
 
 const TOPICS = ['Robotics', 'AI Chips', 'Wearables & XR', 'Edge AI', 'Smart Devices'];
-const DEFAULT_SOURCES = ['Hacker News', 'Dev.to'];
+const DEFAULT_SOURCES = ['Hacker News', 'Dev.to', '36kr', 'X', 'Reddit', 'Weibo'];
 
 const PIPELINE_STAGES = [
   { key: 'fetch', i18nKey: 'stageFetch' as const, parallel: undefined },

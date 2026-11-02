@@ -34,7 +34,7 @@ export async function runReport(signal?: AbortSignal): Promise<TrendReport> {
     body: JSON.stringify({
       conversation_id: CONVERSATION_ID,
       trigger: 'manual',
-      sources: ['hackernews', 'devto', 'web'],
+      sources: ['hackernews', 'devto', 'web', 'tikhub'],
       limit: 30,
     }),
     signal,
@@ -86,7 +86,7 @@ export async function runReportSSE(
     body: JSON.stringify({
       conversation_id: CONVERSATION_ID,
       trigger: 'manual',
-      sources: ['hackernews', 'devto', 'web'],
+      sources: ['hackernews', 'devto', 'web', 'tikhub'],
       limit: 30,
     }),
     signal,
